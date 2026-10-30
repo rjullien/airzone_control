@@ -16,8 +16,9 @@
 ### Changed
 
 - Cloud: single retry on HTTP 5xx / connection errors for read requests (no
-  retry on timeouts, 10 s per request, whole poll bounded by the scan interval
-  with a 30 s minimum); whole-poll failures count against each zone's stale
+  retry on timeouts, 10 s per request; each poll gets a budget of
+  requests x 10 s + 15 s, 30-180 s: once spent no new request starts and
+  the zones already read are still published); whole-poll failures count against each zone's stale
   allowance. HTTP 429
   back-off honouring `Retry-After` (no requests while it runs, poll interval
   temporarily doubled up to 300 s), installation inventory cached for 10 min,

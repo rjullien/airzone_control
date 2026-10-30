@@ -87,8 +87,13 @@ CLOUD_MAX_BACKOFF = 300
 CLOUD_WARNING_INTERVAL = 900
 # Per-request timeout (s) for Cloud status reads; timeouts are not retried.
 CLOUD_REQUEST_TIMEOUT = 10
-# Lower bound (s) for the whole-poll timeout (the scan interval is used if larger).
+# Poll budget: expected requests x CLOUD_REQUEST_TIMEOUT + margin, bounded by
+# [CLOUD_MIN_POLL_TIMEOUT, CLOUD_MAX_POLL_TIMEOUT]. Once the budget is spent no
+# new request is started; what was already read is still published.
 CLOUD_MIN_POLL_TIMEOUT = 30
+CLOUD_MAX_POLL_TIMEOUT = 180
+CLOUD_POLL_MARGIN = 15
+CLOUD_DEFAULT_REQUEST_ESTIMATE = 10
 
 # Códigos numéricos de la Local API -> etiquetas
 # 0/1=Stop, 2=Cooling, 3=Heating, 4=Fan, 5=Dry, 7=Auto

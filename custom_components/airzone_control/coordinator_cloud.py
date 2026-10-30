@@ -28,7 +28,10 @@ from .const import (
     CLOUD_MAX_CONSECUTIVE_FAILURES,
     CLOUD_STATUS_CONCURRENCY,
     CLOUD_WARNING_INTERVAL,
+    CLOUD_DEFAULT_REQUEST_ESTIMATE,
+    CLOUD_MAX_POLL_TIMEOUT,
     CLOUD_MIN_POLL_TIMEOUT,
+    CLOUD_POLL_MARGIN,
     CLOUD_REQUEST_TIMEOUT,
     CONNECTION_TYPE_CLOUD,
     DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES,
@@ -195,6 +198,9 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         self._zone_misses: dict[str, int] = {}
         self.cloud_stale_zones: set[str] = set()
         self._warning_last: dict[str, float] = {}
+        self._request_estimate = CLOUD_DEFAULT_REQUEST_ESTIMATE
+        self._poll_started = 0.0
+        self._poll_deadline: float | None = None
 
     def _warn(self, key: str, message: str, *args: Any) -> None:
         """Log a warning at most once per CLOUD_WARNING_INTERVAL for a given key."""
@@ -706,6 +712,11 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
 
         async def _run(coro: Any) -> Any:
             async with semaphore:
+                if self._poll_deadline is not None and time.monotonic() >= self._poll_deadline:
+                    # Poll budget spent: do not start new requests; results
+                    # already received in this poll are still published.
+                    coro.close()
+                    return TimeoutError("Cloud poll budget exhausted")
                 return await coro
 
         return await asyncio.gather(*[_run(coro) for coro in coroutines], return_exceptions=True)
@@ -1065,8 +1076,12 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                 return self.data
             raise UpdateFailed("Airzone Cloud rate limit back-off active")
 
+        self._poll_started = time.monotonic()
+        self._poll_deadline = self._poll_started + self._poll_budget()
         try:
-            async with asyncio.timeout(self._poll_timeout()):
+            # Hard safety net: the budget only stops *new* requests, an
+            # in-flight one (plus its single retry) may still run.
+            async with asyncio.timeout(self._hard_poll_timeout()):
                 data = await self._async_fetch_cloud_data()
         except ConfigEntryAuthFailed:
             raise
@@ -1079,6 +1094,8 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
             return self._stale_or_raise(
                 UpdateFailed(f"Cloud update failed: {_describe_error(err)}")
             )
+        finally:
+            self._poll_deadline = None
 
         if self._zone_cache and not any(
             self._zone_misses.get(did, 0) == 0 for did in self._zone_cache
@@ -1101,10 +1118,25 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
             self.update_interval = self._base_update_interval
         return data
 
-    def _poll_timeout(self) -> float:
-        base = self._base_update_interval or self.update_interval
-        seconds = base.total_seconds() if base else DEFAULT_CLOUD_SCAN_INTERVAL
-        return float(max(CLOUD_MIN_POLL_TIMEOUT, seconds))
+    def _poll_budget(self, requests: int | None = None) -> float:
+        """Time budget for one poll, sized on the number of sequential requests."""
+        count = max(1, int(requests if requests is not None else self._request_estimate))
+        budget = count * CLOUD_REQUEST_TIMEOUT + CLOUD_POLL_MARGIN
+        return float(min(max(budget, CLOUD_MIN_POLL_TIMEOUT), CLOUD_MAX_POLL_TIMEOUT))
+
+    def _hard_poll_timeout(self) -> float:
+        return float(
+            CLOUD_MAX_POLL_TIMEOUT
+            + 2 * CLOUD_REQUEST_TIMEOUT
+            + CLOUD_TRANSIENT_RETRY_DELAY
+            + CLOUD_POLL_MARGIN
+        )
+
+    def _update_request_estimate(self, requests: int) -> None:
+        """Resize the running poll's budget once the request count is known."""
+        self._request_estimate = max(1, requests)
+        if self._poll_deadline is not None:
+            self._poll_deadline = self._poll_started + self._poll_budget(requests)
 
     def _stale_or_raise(self, err: UpdateFailed) -> dict[tuple[int, int], dict[str, Any]]:
         self._consecutive_failures += 1
@@ -1273,6 +1305,10 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         ):
             self._inventory_cache = None
             raise UpdateFailed("Some selected Cloud devices were not found")
+        # Worst case: inventory refresh (list + one detail per installation).
+        self._update_request_estimate(
+            1 + len(installations) + len(ws_tasks) + len(device_entries)
+        )
         device_status_results = await self._gather_limited(
             [
                 self._get_device_status(str(entry.get("installation_id")), str(entry.get("device_id")))

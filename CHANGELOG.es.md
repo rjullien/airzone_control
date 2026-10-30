@@ -16,8 +16,9 @@
 ### Cambiado
 
 - Cloud: un único reintento ante HTTP 5xx / errores de conexión en lecturas (sin
-  reintento en timeouts, 10 s por petición, sondeo completo limitado al
-  intervalo con un mínimo de 30 s); los fallos de sondeo completo cuentan para
+  reintento en timeouts, 10 s por petición; cada sondeo dispone de
+  peticiones x 10 s + 15 s, entre 30 y 180 s: agotado, no se lanzan más
+  peticiones y se publican las zonas ya leídas); los fallos de sondeo completo cuentan para
   el margen de cada zona. Espera ante
   HTTP 429 respetando `Retry-After` (sin peticiones mientras dura, intervalo
   duplicado temporalmente hasta 300 s), inventario cacheado 10 min, peticiones

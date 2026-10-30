@@ -22,12 +22,14 @@ base_coord = importlib.import_module("custom_components.airzone_control.coordina
 const = importlib.import_module("custom_components.airzone_control.const")
 climate = importlib.import_module("custom_components.airzone_control.climate")
 
+_real_sleep = asyncio.sleep
 INST = "inst1"
 ZONES = {"z1": 1, "z2": 2, "z3": 3}
 
 
 class FakeResponse:
-    def __init__(self, status, payload=None, headers=None):
+    def __init__(self, status, payload=None, headers=None, delay=0.0):
+        self.delay = delay
         self.status = status
         self._payload = payload
         self.headers = headers or {}
@@ -36,6 +38,8 @@ class FakeResponse:
         return self._payload
 
     async def __aenter__(self):
+        if self.delay:
+            await _real_sleep(self.delay)
         return self
 
     async def __aexit__(self, *exc):
@@ -48,8 +52,17 @@ class FakeCloud:
     def __init__(self):
         self.calls = []
         self.fail = {}  # path -> list of status codes / exceptions to return first
+        self.delay = {}  # path prefix -> seconds per request (default: all)
+        self.default_delay = 0.0
 
     def request(self, method, url, **kwargs):
+        resp = self._request(method, url, **kwargs)
+        if isinstance(resp, FakeResponse):
+            path = url.split("/api/v1", 1)[1]
+            resp.delay = self.delay.get(path, self.default_delay)
+        return resp
+
+    def _request(self, method, url, **kwargs):
         path = url.split("/api/v1", 1)[1]
         self.calls.append(path)
         queue = self.fail.get(path)
@@ -217,7 +230,7 @@ def test_poll_has_a_global_timeout(coordinator):
         async def hang():
             await never.wait()
 
-        coordinator._poll_timeout = lambda: 0.05
+        coordinator._hard_poll_timeout = lambda: 0.05
         with patch.object(coordinator, "_async_fetch_cloud_data", hang):
             data = await coordinator._async_update_data()
         assert len(data) == 3 and coordinator._consecutive_failures == 1
@@ -225,10 +238,60 @@ def test_poll_has_a_global_timeout(coordinator):
     asyncio.run(scenario())  # real sleep needed for the timeout
 
 
-def test_poll_timeout_follows_scan_interval(coordinator):
-    assert coordinator._poll_timeout() == 60
-    coordinator._base_update_interval = timedelta(seconds=15)
-    assert coordinator._poll_timeout() == const.CLOUD_MIN_POLL_TIMEOUT
+def test_poll_budget_scales_with_request_count(coordinator):
+    rt = const.CLOUD_REQUEST_TIMEOUT
+    assert coordinator._poll_budget(1) == const.CLOUD_MIN_POLL_TIMEOUT
+    assert coordinator._poll_budget(8) == 8 * rt + const.CLOUD_POLL_MARGIN
+    assert coordinator._poll_budget(1000) == const.CLOUD_MAX_POLL_TIMEOUT
+    assert coordinator._hard_poll_timeout() > const.CLOUD_MAX_POLL_TIMEOUT
+
+
+def _tiny_budget(monkeypatch, request_timeout):
+    """Scale the budget constants down so the test runs in milliseconds."""
+    monkeypatch.setattr(cc, "CLOUD_REQUEST_TIMEOUT", request_timeout)
+    monkeypatch.setattr(cc, "CLOUD_MIN_POLL_TIMEOUT", 0)
+    monkeypatch.setattr(cc, "CLOUD_POLL_MARGIN", 0)
+    monkeypatch.setattr(cc, "CLOUD_MAX_POLL_TIMEOUT", 10)
+
+
+def test_slow_but_valid_requests_exceeding_scan_interval_are_kept(coordinator, monkeypatch):
+    """Each request is within its own timeout, the sum exceeds the interval."""
+    _tiny_budget(monkeypatch, request_timeout=0.05)
+
+    async def scenario():
+        await _poll(coordinator)  # learns the request count (2 inventory + 3 zones)
+        coordinator._base_update_interval = timedelta(seconds=0.05)
+        coordinator.update_interval = timedelta(seconds=0.05)
+        coordinator._fake.default_delay = 0.03  # < 0.05 per request, ~0.15 s total
+        coordinator._inventory_cache = None
+        for _ in range(3):
+            started = time.monotonic()
+            data = await _poll(coordinator)
+            assert time.monotonic() - started > 0.05  # longer than the interval
+            assert len(data) == 3
+            assert coordinator.cloud_stale_zones == set()
+            assert coordinator._consecutive_failures == 0
+
+    asyncio.run(scenario())
+
+
+def test_budget_overrun_publishes_zones_already_read(coordinator, monkeypatch):
+    _tiny_budget(monkeypatch, request_timeout=0.02)
+
+    async def scenario():
+        await _poll(coordinator)
+        cloud = coordinator._fake
+        # z2 answers late (budget spent while it is in flight) -> z3 not started
+        cloud.delay["/devices/z2/status"] = 0.3
+        before = cloud.count("/devices/z3/status")
+        data = await _poll(coordinator)
+        assert cloud.count("/devices/z3/status") == before  # never requested
+        assert len(data) == 3
+        assert coordinator.cloud_stale_zones == {"z3"}  # z1/z2 fresh, z3 cached
+        assert coordinator._zone_misses["z1"] == 0 and coordinator._zone_misses["z2"] == 0
+        assert coordinator._zone_misses["z3"] == 1
+
+    asyncio.run(scenario())
 
 
 def test_429_starts_backoff_and_skips_requests(coordinator):
