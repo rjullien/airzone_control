@@ -85,6 +85,10 @@ CLOUD_DEFAULT_RETRY_AFTER = 60
 CLOUD_MAX_BACKOFF = 300
 # Minimum delay between two identical Cloud warnings in the log (seconds).
 CLOUD_WARNING_INTERVAL = 900
+# Per-request timeout (s) for Cloud status reads; timeouts are not retried.
+CLOUD_REQUEST_TIMEOUT = 10
+# Lower bound (s) for the whole-poll timeout (the scan interval is used if larger).
+CLOUD_MIN_POLL_TIMEOUT = 30
 
 # Códigos numéricos de la Local API -> etiquetas
 # 0/1=Stop, 2=Cooling, 3=Heating, 4=Fan, 5=Dry, 7=Auto

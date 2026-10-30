@@ -28,6 +28,8 @@ from .const import (
     CLOUD_MAX_CONSECUTIVE_FAILURES,
     CLOUD_STATUS_CONCURRENCY,
     CLOUD_WARNING_INTERVAL,
+    CLOUD_MIN_POLL_TIMEOUT,
+    CLOUD_REQUEST_TIMEOUT,
     CONNECTION_TYPE_CLOUD,
     DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES,
     DEFAULT_CLOUD_BASE_URL,
@@ -602,7 +604,7 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                 params=params,
                 json=body,
                 headers=headers,
-                timeout=20,
+                timeout=CLOUD_REQUEST_TIMEOUT,
             ) as response:
                 status = response.status
                 retry_after_header = response.headers.get("Retry-After")
@@ -612,7 +614,9 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                 except Exception:
                     payload = None
         except (aiohttp.ClientConnectionError, TimeoutError) as err:
-            if can_retry:
+            # Timeouts are not retried (aiohttp.ServerTimeoutError is also a
+            # ClientConnectionError) so one poll stays bounded in time.
+            if can_retry and not isinstance(err, TimeoutError):
                 _LOGGER.debug(
                     "Retrying Cloud request after %s", type(err).__name__
                 )
@@ -1062,7 +1066,8 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
             raise UpdateFailed("Airzone Cloud rate limit back-off active")
 
         try:
-            data = await self._async_fetch_cloud_data()
+            async with asyncio.timeout(self._poll_timeout()):
+                data = await self._async_fetch_cloud_data()
         except ConfigEntryAuthFailed:
             raise
         except CloudZonesUnavailable:
@@ -1074,6 +1079,13 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
             return self._stale_or_raise(
                 UpdateFailed(f"Cloud update failed: {_describe_error(err)}")
             )
+
+        if self._zone_cache and not any(
+            self._zone_misses.get(did, 0) == 0 for did in self._zone_cache
+        ):
+            # Every zone came from the stale cache: not a real recovery, keep
+            # the failure counter (and the slowed interval) as they are.
+            return data
 
         if self._consecutive_failures:
             _LOGGER.info(
@@ -1089,12 +1101,34 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
             self.update_interval = self._base_update_interval
         return data
 
+    def _poll_timeout(self) -> float:
+        base = self._base_update_interval or self.update_interval
+        seconds = base.total_seconds() if base else DEFAULT_CLOUD_SCAN_INTERVAL
+        return float(max(CLOUD_MIN_POLL_TIMEOUT, seconds))
+
     def _stale_or_raise(self, err: UpdateFailed) -> dict[tuple[int, int], dict[str, Any]]:
         self._consecutive_failures += 1
+        # A whole-poll failure is also a failed read for every known zone, so
+        # it counts against each zone's stale-data allowance.
+        for device_id in self._zone_cache:
+            self._zone_misses[device_id] = self._zone_misses.get(device_id, 0) + 1
         if (
             self.data is not None
             and self._consecutive_failures < CLOUD_MAX_CONSECUTIVE_FAILURES
         ):
+            expired = {
+                (self._to_int(zone.get("systemID")), self._to_int(zone.get("zoneID")))
+                for device_id, zone in self._zone_cache.items()
+                if self._zone_misses.get(device_id, 0) >= CLOUD_MAX_CONSECUTIVE_FAILURES
+            }
+            if expired:
+                kept = {key: zone for key, zone in self.data.items() if key not in expired}
+                if not kept:
+                    raise err
+                comparison = getattr(self.data, "_comparison_data", ())
+                stale = AirzoneData(kept, comparison)
+            else:
+                stale = self.data
             self._warn(
                 "poll_failed",
                 "Airzone Cloud update failed (%s); keeping last data (%s/%s)",
@@ -1102,7 +1136,7 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                 self._consecutive_failures,
                 CLOUD_MAX_CONSECUTIVE_FAILURES,
             )
-            return self.data
+            return stale
         raise err
 
     async def _get_inventory(

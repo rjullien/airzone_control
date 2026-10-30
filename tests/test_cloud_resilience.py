@@ -151,16 +151,84 @@ def test_all_zones_failing_becomes_unavailable_only_after_threshold(coordinator)
     run(scenario())
 
 
-def test_transient_5xx_and_timeout_are_retried_once(coordinator):
+def test_5xx_is_retried_once_but_timeout_is_not(coordinator):
     async def scenario():
         await _poll(coordinator)
         coordinator._fake.fail["/devices/z1/status"] = [503]
         coordinator._fake.fail["/devices/z2/status"] = [asyncio.TimeoutError()]
         before = coordinator._fake.count("/devices/")
         data = await _poll(coordinator)
-        assert len(data) == 3 and coordinator.cloud_stale_zones == set()
-        assert coordinator._fake.count("/devices/") - before == 5  # 3 + 2 retries
+        assert len(data) == 3
+        # z1 recovered by its retry, z2 (timeout, no retry) served from cache
+        assert coordinator.cloud_stale_zones == {"z2"}
+        assert coordinator._fake.count("/devices/") - before == 4  # 3 + 1 retry
     run(scenario())
+
+
+def test_alternating_failures_respect_zone_allowance(coordinator):
+    """Whole-poll failures count against each zone's stale allowance."""
+    async def scenario():
+        await _poll(coordinator)
+        cloud = coordinator._fake
+
+        def fail_all_zones():
+            for did in ZONES:
+                cloud.fail[f"/devices/{did}/status"] = [500, 500]
+
+        def fail_z1():
+            cloud.fail["/devices/z1/status"] = [500, 500]
+
+        # miss 1: whole poll fails (all device statuses) -> previous data
+        fail_all_zones()
+        assert len(await _poll(coordinator)) == 3
+        # miss 2: only z1 fails, others OK -> z1 still served from cache
+        fail_z1()
+        data = await _poll(coordinator)
+        assert len(data) == 3 and coordinator.cloud_stale_zones == {"z1"}
+        # miss 3: whole poll fails again -> z1 must be gone from the stale data
+        fail_all_zones()
+        data = await _poll(coordinator)
+        assert (1, 1) not in data and len(data) == 2
+
+    run(scenario())
+
+
+def test_all_cached_zones_is_not_a_recovery(coordinator):
+    async def scenario():
+        await _poll(coordinator)
+        for did in ZONES:
+            coordinator._fake.fail[f"/devices/{did}/status"] = [500, 500]
+        await _poll(coordinator)  # whole-poll failure
+        assert coordinator._consecutive_failures == 1
+        # add an IAQ-like success is not modelled; zones failing individually
+        # while the poll "succeeds" must not reset the failure counter
+        coordinator._zone_misses = {did: 1 for did in ZONES}
+        with patch.object(coordinator, "_async_fetch_cloud_data", return_value=coordinator.data):
+            await coordinator._async_update_data()
+        assert coordinator._consecutive_failures == 1
+    run(scenario())
+
+
+def test_poll_has_a_global_timeout(coordinator):
+    async def scenario():
+        await _poll(coordinator)
+        never = asyncio.Event()
+
+        async def hang():
+            await never.wait()
+
+        coordinator._poll_timeout = lambda: 0.05
+        with patch.object(coordinator, "_async_fetch_cloud_data", hang):
+            data = await coordinator._async_update_data()
+        assert len(data) == 3 and coordinator._consecutive_failures == 1
+
+    asyncio.run(scenario())  # real sleep needed for the timeout
+
+
+def test_poll_timeout_follows_scan_interval(coordinator):
+    assert coordinator._poll_timeout() == 60
+    coordinator._base_update_interval = timedelta(seconds=15)
+    assert coordinator._poll_timeout() == const.CLOUD_MIN_POLL_TIMEOUT
 
 
 def test_429_starts_backoff_and_skips_requests(coordinator):
