@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
+from email.utils import parsedate_to_datetime
 import hashlib
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -19,6 +22,12 @@ from .const import (
     CLOUD_CATEGORY_CLIMATE_ZONES,
     CLOUD_CATEGORY_ENERGY,
     CLOUD_CATEGORY_IAQ,
+    CLOUD_DEFAULT_RETRY_AFTER,
+    CLOUD_INVENTORY_TTL,
+    CLOUD_MAX_BACKOFF,
+    CLOUD_MAX_CONSECUTIVE_FAILURES,
+    CLOUD_STATUS_CONCURRENCY,
+    CLOUD_WARNING_INTERVAL,
     CONNECTION_TYPE_CLOUD,
     DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES,
     DEFAULT_CLOUD_BASE_URL,
@@ -56,6 +65,29 @@ class CloudApiError(Exception):
         self.error_id = error_id or "unknown"
         self.message = message or self.error_id
         super().__init__(self.message)
+
+
+class CloudRateLimitedError(CloudApiError):
+    """Airzone Cloud answered HTTP 429."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("http_429", f"HTTP 429 (retry after {retry_after:.0f}s)")
+        self.retry_after = retry_after
+
+
+class CloudZonesUnavailable(UpdateFailed):
+    """No zone could be read, even from the per-zone stale cache."""
+
+
+# Delay before the single retry of a transient (5xx / timeout / connection) GET.
+CLOUD_TRANSIENT_RETRY_DELAY = 1.0
+
+
+def _describe_error(err: BaseException) -> str:
+    """Short, secret-free description of a Cloud request failure."""
+    if isinstance(err, CloudApiError):
+        return f"{type(err).__name__}({err.error_id})"
+    return type(err).__name__
 
 
 async def async_cloud_login(
@@ -151,6 +183,65 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         self.transport_iaq = "cloud"
         self.driver = "cloud"
         self.expose_webserver_entities = self._cloud_category_enabled(CLOUD_CATEGORY_CLIMATE_ZONES)
+
+        # Resilience state (see _async_update_data).
+        self._base_update_interval: timedelta | None = self.update_interval
+        self._backoff_until = 0.0
+        self._consecutive_failures = 0
+        self._inventory_cache: tuple[list[dict[str, Any]], dict[str, dict[str, Any]], float] | None = None
+        self._zone_cache: dict[str, dict[str, Any]] = {}
+        self._zone_misses: dict[str, int] = {}
+        self.cloud_stale_zones: set[str] = set()
+        self._warning_last: dict[str, float] = {}
+
+    def _warn(self, key: str, message: str, *args: Any) -> None:
+        """Log a warning at most once per CLOUD_WARNING_INTERVAL for a given key."""
+        now = time.monotonic()
+        last = self._warning_last.get(key)
+        if last is not None and now - last < CLOUD_WARNING_INTERVAL:
+            _LOGGER.debug(message, *args)
+            return
+        self._warning_last[key] = now
+        _LOGGER.warning(message, *args)
+
+    @staticmethod
+    def _parse_retry_after(value: str | None) -> float:
+        """Return a bounded Retry-After delay in seconds."""
+        delay: float | None = None
+        if value:
+            value = value.strip()
+            try:
+                delay = float(value)
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(value)
+                    delay = retry_at.timestamp() - time.time()
+                except (TypeError, ValueError, IndexError, OverflowError):
+                    delay = None
+        if delay is None:
+            delay = float(CLOUD_DEFAULT_RETRY_AFTER)
+        return float(min(max(delay, 1.0), CLOUD_MAX_BACKOFF))
+
+    def _start_backoff(self, retry_after: float) -> None:
+        """Pause polling after HTTP 429 and slow down the update interval."""
+        self._backoff_until = max(self._backoff_until, time.monotonic() + retry_after)
+        base = self._base_update_interval or self.update_interval or timedelta(seconds=DEFAULT_CLOUD_SCAN_INTERVAL)
+        current = self.update_interval or base
+        slowed = min(
+            max(current * 2, timedelta(seconds=retry_after)),
+            timedelta(seconds=CLOUD_MAX_BACKOFF),
+        )
+        if slowed > current:
+            self.update_interval = slowed
+        self._warn(
+            "rate_limited",
+            "Airzone Cloud rate limit (HTTP 429): pausing for %.0fs, polling every %ss",
+            retry_after,
+            int((self.update_interval or base).total_seconds()),
+        )
+
+    def _backoff_active(self) -> bool:
+        return time.monotonic() < self._backoff_until
 
     async def async_initialize_energy_store(self) -> None:
         """Load persistent totals before the first Cloud refresh."""
@@ -480,54 +571,91 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         params: dict[str, Any] | None = None,
         body: dict[str, Any] | None = None,
         retry_auth: bool = True,
+        retry_transient: bool = True,
     ) -> dict[str, Any] | list[Any] | None:
+        if self._backoff_active():
+            # Do not keep hammering the Cloud while a 429 back-off is running.
+            raise CloudRateLimitedError(self._backoff_until - time.monotonic())
         await self._ensure_authenticated()
         session = await self._ensure_session()
         url = f"{self._base_url}{path}"
         token_used = self._token
         headers = {"Authorization": f"Bearer {token_used}"}
+        # Only idempotent reads are retried automatically.
+        can_retry = retry_transient and method.upper() == "GET"
 
-        async with session.request(
-            method,
-            url,
-            params=params,
-            json=body,
-            headers=headers,
-            timeout=20,
-        ) as response:
-            payload: dict[str, Any] | list[Any] | None = None
-            try:
-                payload = await response.json(content_type=None)
-            except Exception:
-                payload = None
+        async def _retry() -> dict[str, Any] | list[Any] | None:
+            await asyncio.sleep(CLOUD_TRANSIENT_RETRY_DELAY)
+            return await self._cloud_request_json(
+                method,
+                path,
+                params=params,
+                body=body,
+                retry_auth=retry_auth,
+                retry_transient=False,
+            )
 
-            if response.status == 401 and retry_auth:
-                async with self._auth_lock:
-                    if self._token == token_used:
-                        await self._refresh_access_token()
-                return await self._cloud_request_json(
-                    method,
-                    path,
-                    params=params,
-                    body=body,
-                    retry_auth=False,
+        try:
+            async with session.request(
+                method,
+                url,
+                params=params,
+                json=body,
+                headers=headers,
+                timeout=20,
+            ) as response:
+                status = response.status
+                retry_after_header = response.headers.get("Retry-After")
+                payload: dict[str, Any] | list[Any] | None = None
+                try:
+                    payload = await response.json(content_type=None)
+                except Exception:
+                    payload = None
+        except (aiohttp.ClientConnectionError, TimeoutError) as err:
+            if can_retry:
+                _LOGGER.debug(
+                    "Retrying Cloud request after %s", type(err).__name__
                 )
+                return await _retry()
+            raise
 
-            if response.status == 401:
-                self._token = None
-                raise ConfigEntryAuthFailed(
-                    "Airzone Cloud rejected the refreshed credentials"
-                )
+        if status == 401 and retry_auth:
+            async with self._auth_lock:
+                if self._token == token_used:
+                    await self._refresh_access_token()
+            return await self._cloud_request_json(
+                method,
+                path,
+                params=params,
+                body=body,
+                retry_auth=False,
+                retry_transient=retry_transient,
+            )
 
-            if response.status >= 400:
-                error_id = payload.get("_id") if isinstance(payload, dict) else None
-                message = payload.get("msg") if isinstance(payload, dict) else None
-                raise CloudApiError(
-                    str(error_id or f"http_{response.status}"),
-                    str(message or f"HTTP {response.status}"),
-                )
+        if status == 401:
+            self._token = None
+            raise ConfigEntryAuthFailed(
+                "Airzone Cloud rejected the refreshed credentials"
+            )
 
-            return payload if payload is not None else {}
+        if status == 429:
+            retry_after = self._parse_retry_after(retry_after_header)
+            self._start_backoff(retry_after)
+            raise CloudRateLimitedError(retry_after)
+
+        if status >= 500 and can_retry:
+            _LOGGER.debug("Retrying Cloud request after HTTP %s", status)
+            return await _retry()
+
+        if status >= 400:
+            error_id = payload.get("_id") if isinstance(payload, dict) else None
+            message = payload.get("msg") if isinstance(payload, dict) else None
+            raise CloudApiError(
+                str(error_id or f"http_{status}"),
+                str(message or f"HTTP {status}"),
+            )
+
+        return payload if payload is not None else {}
 
     async def _get_installations(self) -> list[dict[str, Any]]:
         first = await self._cloud_request_json("GET", "/installations", params={"items": 10, "page": 0})
@@ -922,21 +1050,96 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         return summary
 
     async def _async_update_data(self) -> dict[tuple[int, int], dict[str, Any]]:
-        if self._require_device_selection and not self._include_device_ids:
-            raise UpdateFailed("This Cloud profile requires a device selection")
+        """Refresh Cloud data, tolerating short, transient Cloud failures.
+
+        A failed poll keeps the last valid data for up to
+        CLOUD_MAX_CONSECUTIVE_FAILURES - 1 consecutive polls before entities
+        become unavailable; while a 429 back-off is active no request is sent.
+        """
+        if self._backoff_active():
+            if self.data is not None:
+                return self.data
+            raise UpdateFailed("Airzone Cloud rate limit back-off active")
+
+        try:
+            data = await self._async_fetch_cloud_data()
+        except ConfigEntryAuthFailed:
+            raise
+        except CloudZonesUnavailable:
+            self._consecutive_failures += 1
+            raise
+        except UpdateFailed as err:
+            return self._stale_or_raise(err)
+        except (CloudApiError, aiohttp.ClientError, TimeoutError) as err:
+            return self._stale_or_raise(
+                UpdateFailed(f"Cloud update failed: {_describe_error(err)}")
+            )
+
+        if self._consecutive_failures:
+            _LOGGER.info(
+                "Airzone Cloud update recovered after %s failed poll(s)",
+                self._consecutive_failures,
+            )
+        self._consecutive_failures = 0
+        if (
+            self._base_update_interval is not None
+            and self.update_interval != self._base_update_interval
+            and not self._backoff_active()
+        ):
+            self.update_interval = self._base_update_interval
+        return data
+
+    def _stale_or_raise(self, err: UpdateFailed) -> dict[tuple[int, int], dict[str, Any]]:
+        self._consecutive_failures += 1
+        if (
+            self.data is not None
+            and self._consecutive_failures < CLOUD_MAX_CONSECUTIVE_FAILURES
+        ):
+            self._warn(
+                "poll_failed",
+                "Airzone Cloud update failed (%s); keeping last data (%s/%s)",
+                err,
+                self._consecutive_failures,
+                CLOUD_MAX_CONSECUTIVE_FAILURES,
+            )
+            return self.data
+        raise err
+
+    async def _get_inventory(
+        self,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        """Return installations and their details, cached for CLOUD_INVENTORY_TTL."""
+        cached = self._inventory_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[2] < CLOUD_INVENTORY_TTL:
+            return cached[0], cached[1]
 
         try:
             installations = await self._get_installations()
-        except CloudApiError as err:
-            raise UpdateFailed(f"Cloud installations fetch failed: {err.error_id}") from err
-        except (aiohttp.ClientError, TimeoutError) as err:
+        except (CloudApiError, aiohttp.ClientError, TimeoutError) as err:
+            if cached is not None:
+                self._warn(
+                    "inventory",
+                    "Cloud installations fetch failed (%s); using cached inventory",
+                    _describe_error(err),
+                )
+                return cached[0], cached[1]
+            if isinstance(err, CloudApiError):
+                raise UpdateFailed(
+                    f"Cloud installations fetch failed: {err.error_id}"
+                ) from err
             raise UpdateFailed(
                 f"Cloud connection failed: {type(err).__name__}"
             ) from err
 
+        installation_ids = [
+            str(item.get("installation_id"))
+            for item in installations
+            if item.get("installation_id")
+        ]
         detail_results = await self._gather_limited(
-            [self._get_installation_detail(str(item.get("installation_id"))) for item in installations if item.get("installation_id")],
-            limit=4,
+            [self._get_installation_detail(iid) for iid in installation_ids],
+            limit=CLOUD_STATUS_CONCURRENCY,
         )
         for result in detail_results:
             if isinstance(result, ConfigEntryAuthFailed):
@@ -945,16 +1148,30 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         details_by_installation: dict[str, dict[str, Any]] = {}
         for detail in detail_results:
             if isinstance(detail, Exception):
-                _LOGGER.debug(
+                self._warn(
+                    "inventory_detail",
                     "Cloud installation detail fetch failed: %s",
-                    type(detail).__name__,
+                    _describe_error(detail),
                 )
                 continue
             if isinstance(detail, dict) and detail.get("installation_id"):
                 details_by_installation[str(detail.get("installation_id"))] = detail
 
-        if installations and detail_results and not details_by_installation:
-            raise UpdateFailed("All Cloud installation detail requests failed")
+        if len(details_by_installation) < len(installation_ids):
+            if cached is not None:
+                return cached[0], cached[1]
+            if installation_ids and not details_by_installation:
+                raise UpdateFailed("All Cloud installation detail requests failed")
+            return installations, details_by_installation
+
+        self._inventory_cache = (installations, details_by_installation, now)
+        return installations, details_by_installation
+
+    async def _async_fetch_cloud_data(self) -> dict[tuple[int, int], dict[str, Any]]:
+        if self._require_device_selection and not self._include_device_ids:
+            raise UpdateFailed("This Cloud profile requires a device selection")
+
+        installations, details_by_installation = await self._get_inventory()
 
         ws_tasks: list[Any] = []
         for item in installations:
@@ -963,10 +1180,16 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                 continue
             for ws_id in item.get("ws_ids", []) or []:
                 ws_tasks.append(self._get_webserver_status(str(installation_id), str(ws_id)))
-        ws_results = await self._gather_limited(ws_tasks, limit=4)
+        ws_results = await self._gather_limited(ws_tasks, limit=CLOUD_STATUS_CONCURRENCY)
         for result in ws_results:
             if isinstance(result, ConfigEntryAuthFailed):
                 raise result
+            if isinstance(result, Exception):
+                self._warn(
+                    "status:webserver",
+                    "Cloud webserver status fetch failed: %s",
+                    _describe_error(result),
+                )
         ws_payloads = [payload for payload in ws_results if isinstance(payload, dict)]
         self.webserver_update_success = not ws_tasks or bool(ws_payloads)
 
@@ -1014,13 +1237,14 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         if self._require_device_selection and (
             self._include_device_ids - set(inventory_by_device)
         ):
+            self._inventory_cache = None
             raise UpdateFailed("Some selected Cloud devices were not found")
         device_status_results = await self._gather_limited(
             [
                 self._get_device_status(str(entry.get("installation_id")), str(entry.get("device_id")))
                 for entry in device_entries
             ],
-            limit=6,
+            limit=CLOUD_STATUS_CONCURRENCY,
         )
         for result in device_status_results:
             if isinstance(result, ConfigEntryAuthFailed):
@@ -1044,26 +1268,26 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         previous_iaqs = dict(self.iaqs or {})
         stale_energy_meters: set[str] = set()
         stale_iaqs: set[tuple[int, int]] = set()
+        stale_zones: set[str] = set()
 
         for entry, status in zip(device_entries, device_status_results, strict=False):
-            if isinstance(status, Exception):
-                _LOGGER.debug(
-                    "Cloud device status fetch failed: %s", type(status).__name__
+            if isinstance(status, Exception) or not isinstance(status, dict):
+                device_id = str(entry.get("device_id") or "")
+                device_type = entry.get("device_type")
+                self._warn(
+                    f"status:{device_type}",
+                    "Cloud %s status fetch failed: %s",
+                    device_type,
+                    _describe_error(status) if isinstance(status, Exception) else "empty response",
                 )
-                device_id = str(entry.get("device_id") or "")
-                device_type = entry.get("device_type")
-                if device_type in ENERGY_DEVICE_TYPES and device_id in previous_energy_meters:
-                    energy_meters[device_id] = previous_energy_meters[device_id]
-                    stale_energy_meters.add(device_id)
-                elif device_type in IAQ_DEVICE_TYPES:
-                    previous_key, previous_iaq = self._previous_cloud_iaq(previous_iaqs, entry)
-                    if previous_key is not None and previous_iaq is not None:
-                        iaqs[previous_key] = previous_iaq
-                        stale_iaqs.add(previous_key)
-                continue
-            if not isinstance(status, dict):
-                device_id = str(entry.get("device_id") or "")
-                device_type = entry.get("device_type")
+                if device_type in ZONE_DEVICE_TYPES:
+                    misses = self._zone_misses.get(device_id, 0) + 1
+                    self._zone_misses[device_id] = misses
+                    cached_zone = self._zone_cache.get(device_id)
+                    if cached_zone is not None and misses < CLOUD_MAX_CONSECUTIVE_FAILURES:
+                        zones.append(dict(cached_zone))
+                        stale_zones.add(device_id)
+                    continue
                 if device_type in ENERGY_DEVICE_TYPES and device_id in previous_energy_meters:
                     energy_meters[device_id] = previous_energy_meters[device_id]
                     stale_energy_meters.add(device_id)
@@ -1082,7 +1306,12 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                 continue
 
             if device_type in ZONE_DEVICE_TYPES:
-                zones.append(self._normalize_zone_status(entry, status))
+                zone = self._normalize_zone_status(entry, status)
+                device_id = str(entry.get("device_id") or "")
+                if device_id:
+                    self._zone_cache[device_id] = dict(zone)
+                    self._zone_misses[device_id] = 0
+                zones.append(zone)
                 continue
 
             if device_type in ENERGY_DEVICE_TYPES:
@@ -1120,7 +1349,12 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
                     for entry in device_entries
                 )
                 if expected_zones:
-                    raise UpdateFailed("Cloud update returned no valid zones")
+                    # Every zone already used up its stale-data allowance
+                    # (per-zone cache above), so do not extend it further.
+                    raise CloudZonesUnavailable(
+                        "Cloud update returned no valid zones "
+                        f"({self._hvac_empty_reads} consecutive empty read(s))"
+                    )
         else:
             mapped = {}
             self._hvac_empty_reads = 0
@@ -1144,6 +1378,7 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         self.webserver = self._build_webserver_summary(installations, ws_payloads)
         self.iaqs = iaqs
         self.cloud_stale_iaqs = stale_iaqs
+        self.cloud_stale_zones = stale_zones
         self.iaq_update_success = True
         self.transport_hvac = "cloud"
         self.transport_iaq = "cloud"

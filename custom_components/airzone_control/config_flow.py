@@ -26,6 +26,7 @@ from .const import (
     CLOUD_PROFILE_LABELS,
     CONNECTION_TYPE_CLOUD,
     CONNECTION_TYPE_LOCAL,
+    CONF_CLOUD_CREATE_CLIMATES,
     CONF_CLOUD_EXCLUDE_IAQ_NAMES,
     CONF_CLOUD_INCLUDE_BOUND_IAQS,
     CONF_CLOUD_INCLUDE_CATEGORIES,
@@ -42,6 +43,7 @@ from .const import (
     CONF_USER_ID,
     CONF_VERIFY_SSL,
     DEFAULT_CLOUD_BASE_URL,
+    DEFAULT_CLOUD_CREATE_CLIMATES,
     DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES,
     DEFAULT_CLOUD_INCLUDE_BOUND_IAQS,
     DEFAULT_CLOUD_INCLUDE_CATEGORIES,
@@ -984,6 +986,10 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
             CONF_CLOUD_INCLUDE_BOUND_IAQS,
             self._entry.data.get(CONF_CLOUD_INCLUDE_BOUND_IAQS, include_bound_default),
         )
+        current_cloud_create_climates = self._entry.options.get(
+            CONF_CLOUD_CREATE_CLIMATES,
+            DEFAULT_CLOUD_CREATE_CLIMATES,
+        )
         current_cloud_exclude_iaq_names = self._entry.options.get(
             CONF_CLOUD_EXCLUDE_IAQ_NAMES,
             self._entry.data.get(CONF_CLOUD_EXCLUDE_IAQ_NAMES, DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES),
@@ -1071,6 +1077,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                             DEFAULT_CLOUD_INCLUDE_BOUND_IAQS,
                         )
                     )
+                    options[CONF_CLOUD_CREATE_CLIMATES] = bool(
+                        user_input.get(
+                            CONF_CLOUD_CREATE_CLIMATES,
+                            current_cloud_create_climates,
+                        )
+                    )
                     options[CONF_CLOUD_EXCLUDE_IAQ_NAMES] = (
                         user_input.get(CONF_CLOUD_EXCLUDE_IAQ_NAMES)
                         or DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES
@@ -1136,6 +1148,12 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                 vol.Optional(
                     CONF_CLOUD_INCLUDE_BOUND_IAQS,
                     default=bool(current_cloud_include_bound_iaqs),
+                )
+            ] = cv.boolean
+            schema_dict[
+                vol.Optional(
+                    CONF_CLOUD_CREATE_CLIMATES,
+                    default=bool(current_cloud_create_climates),
                 )
             ] = cv.boolean
             schema_dict[

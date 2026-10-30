@@ -2,6 +2,32 @@
 
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Cloud: transient Airzone Cloud errors no longer make every entity
+  unavailable. A zone whose status request fails keeps its last valid data for
+  up to 2 polls, and a failed poll keeps the previous data until 3
+  consecutive failures.
+- Cloud: read-only climate entities expose `ClimateEntityFeature(0)` instead of
+  a bare `0`.
+
+### Changed
+
+- Cloud: single retry on HTTP 5xx / timeouts for read requests, HTTP 429
+  back-off honouring `Retry-After` (no requests while it runs, poll interval
+  temporarily doubled up to 300 s), installation inventory cached for 10 min,
+  sequential status requests and rate-limited warning logs.
+- Cloud: default scan interval raised from 30 s to 60 s (existing entries keep
+  their configured value).
+
+### Added
+
+- Cloud option "Create read-only Cloud thermostat (climate) entities" (default
+  on). Turn it off when the core `airzone_cloud` integration already provides
+  the thermostats; existing climate entities of this entry are removed.
+
 ## 1.9.1 - 2026-09-15
 
 ### Added

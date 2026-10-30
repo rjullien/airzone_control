@@ -2,6 +2,32 @@
 
 # Historial de Cambios
 
+## Sin publicar
+
+### Corregido
+
+- Cloud: los errores transitorios de Airzone Cloud ya no dejan todas las
+  entidades no disponibles. Una zona cuya consulta falla conserva sus últimos
+  datos válidos durante 2 sondeos como máximo, y un sondeo fallido conserva los
+  datos anteriores hasta 3 fallos consecutivos.
+- Cloud: los termostatos de solo lectura exponen `ClimateEntityFeature(0)` en
+  lugar de `0`.
+
+### Cambiado
+
+- Cloud: un único reintento ante HTTP 5xx / timeouts en lecturas, espera ante
+  HTTP 429 respetando `Retry-After` (sin peticiones mientras dura, intervalo
+  duplicado temporalmente hasta 300 s), inventario cacheado 10 min, peticiones
+  de estado secuenciales y avisos de log limitados.
+- Cloud: intervalo por defecto de 30 s a 60 s (las entradas existentes
+  conservan su valor).
+
+### Añadido
+
+- Opción Cloud "Crear los termostatos (climate) Cloud de solo lectura" (activada
+  por defecto). Desactívala si la integración oficial `airzone_cloud` ya ofrece
+  los termostatos; se eliminan los climate existentes de esta entrada.
+
 ## 1.9.1 - 2026-09-15
 
 ### Añadido

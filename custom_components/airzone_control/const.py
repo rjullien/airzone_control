@@ -20,6 +20,7 @@ CONF_CLOUD_INCLUDE_CATEGORIES = "cloud_include_categories"
 CONF_CLOUD_INCLUDE_DEVICE_IDS = "cloud_include_device_ids"
 CONF_CLOUD_INCLUDE_BOUND_IAQS = "cloud_include_bound_iaqs"
 CONF_CLOUD_EXCLUDE_IAQ_NAMES = "cloud_exclude_iaq_names"
+CONF_CLOUD_CREATE_CLIMATES = "cloud_create_climates"
 CONF_VERIFY_SSL = "verify_ssl"
 CONF_REGISTER_INTEGRATION_DRIVER = "register_integration_driver"
 
@@ -47,6 +48,9 @@ DEFAULT_CLOUD_INCLUDE_CATEGORIES = [
 DEFAULT_CLOUD_INCLUDE_BOUND_IAQS = True
 DEFAULT_CLOUD_INCLUDE_DEVICE_IDS: list[str] = []
 DEFAULT_CLOUD_EXCLUDE_IAQ_NAMES = ""
+# Cloud climates are read-only; allow skipping them when another integration
+# (e.g. core airzone_cloud) already provides controllable thermostats.
+DEFAULT_CLOUD_CREATE_CLIMATES = True
 DEFAULT_CLOUD_PROFILE = CLOUD_PROFILE_FULL
 DEFAULT_VERIFY_SSL = True
 DEFAULT_REGISTER_INTEGRATION_DRIVER = False
@@ -67,7 +71,20 @@ CLOUD_PROFILE_LABELS: dict[str, str] = {
 
 # Intervalo de sondeo por defecto (segundos). Cambiable en Opciones.
 DEFAULT_SCAN_INTERVAL = 5
-DEFAULT_CLOUD_SCAN_INTERVAL = 30
+DEFAULT_CLOUD_SCAN_INTERVAL = 60
+
+# Cloud resilience: a missing reading is tolerated for this many consecutive
+# polls (last valid data is kept) before entities become unavailable.
+CLOUD_MAX_CONSECUTIVE_FAILURES = 3
+# Installations/detail inventory barely changes: refresh it at most this often.
+CLOUD_INVENTORY_TTL = 600
+# Device status requests are sent one at a time to avoid Cloud bursts.
+CLOUD_STATUS_CONCURRENCY = 1
+# Retry-After fallback and upper bound (seconds) for HTTP 429 back-off.
+CLOUD_DEFAULT_RETRY_AFTER = 60
+CLOUD_MAX_BACKOFF = 300
+# Minimum delay between two identical Cloud warnings in the log (seconds).
+CLOUD_WARNING_INTERVAL = 900
 
 # Códigos numéricos de la Local API -> etiquetas
 # 0/1=Stop, 2=Cooling, 3=Heating, 4=Fan, 5=Dry, 7=Auto

@@ -12,11 +12,18 @@ from homeassistant.components.climate.const import (
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.config_entries import ConfigEntry
 
-from .const import DOMAIN, CONF_GROUPS
+from .const import (
+    CONF_CLOUD_CREATE_CLIMATES,
+    CONF_GROUPS,
+    CONNECTION_TYPE_CLOUD,
+    DEFAULT_CLOUD_CREATE_CLIMATES,
+    DOMAIN,
+)
 from .coordinator import AirzoneCoordinator
 from .api_modes import (
     allowed_hvac_modes_for_zone,
@@ -118,6 +125,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
         _LOGGER.warning("AirzoneCoordinator not found; aborting climate setup.")
         return
 
+    if getattr(coordinator, "connection_type", None) == CONNECTION_TYPE_CLOUD and not entry.options.get(
+        CONF_CLOUD_CREATE_CLIMATES, DEFAULT_CLOUD_CREATE_CLIMATES
+    ):
+        # Read-only Cloud thermostats disabled (e.g. core airzone_cloud already
+        # provides controllable ones): drop any previously registered entity.
+        _async_remove_climate_entities(hass, entry)
+        _LOGGER.debug("Cloud climate entities disabled by option.")
+        return
+
     entities: List[ClimateEntity] = []
 
     # --- Termostatos de ZONA (uno por cada zona descubierta) ---
@@ -165,6 +181,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, add_entitie
         add_entities(entities)
     else:
         _LOGGER.debug("No climate entities to add (no zones found).")
+
+
+def _async_remove_climate_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Remove climate entities this config entry registered earlier."""
+    registry = er.async_get(hass)
+    for reg_entry in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if reg_entry.domain == "climate" and reg_entry.platform == DOMAIN:
+            registry.async_remove(reg_entry.entity_id)
 
 
 class AirzoneZoneClimate(CoordinatorEntity[AirzoneCoordinator], ClimateEntity):
