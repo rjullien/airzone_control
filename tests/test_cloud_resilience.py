@@ -353,3 +353,46 @@ def test_climate_option_disables_cloud_climates():
         asyncio.run(climate.async_setup_entry(hass, entry, add))
     remove.assert_called_once()
     add.assert_not_called()
+
+
+class ManyInstallationsCloud(FakeCloud):
+    """13 installations; the zones live in the last one."""
+
+    N = 13
+
+    def _request(self, method, url, **kwargs):
+        path = url.split("/api/v1", 1)[1]
+        if path == "/installations":
+            self.calls.append(path)
+            page = (kwargs.get("params") or {}).get("page", 0)
+            ids = [f"i{n}" for n in range(self.N)][page * 10:(page + 1) * 10]
+            return FakeResponse(200, {"installations": [{"installation_id": i, "ws_ids": []} for i in ids],
+                                      "total": self.N})
+        if path.startswith("/installations/i"):
+            self.calls.append(path)
+            iid = path.rsplit("/", 1)[1]
+            devices = []
+            if iid == f"i{self.N - 1}":
+                devices = [
+                    {"device_id": did, "type": "az_zone", "name": f"Zone {n}",
+                     "meta": {"system_number": 1, "zone_number": n}}
+                    for did, n in ZONES.items()
+                ]
+            return FakeResponse(200, {"installation_id": iid, "groups": [{"devices": devices}]})
+        return super()._request(method, url, **kwargs)
+
+
+def test_budget_is_resized_before_installation_details(coordinator, monkeypatch):
+    _tiny_budget(monkeypatch, request_timeout=0.02)
+    cloud = ManyInstallationsCloud()
+    cloud.default_delay = 0.012  # each request well within its own timeout
+    coordinator._session = cloud
+    coordinator._fake = cloud
+    coordinator._request_estimate = 2  # stale small estimate from a previous poll
+
+    async def scenario():
+        data = await _poll(coordinator)
+        assert cloud.count("/installations/i") == ManyInstallationsCloud.N
+        assert len(data) == 3  # zones of the last installation are present
+
+    asyncio.run(scenario())

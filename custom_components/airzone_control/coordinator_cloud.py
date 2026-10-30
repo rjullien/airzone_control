@@ -201,6 +201,7 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         self._request_estimate = CLOUD_DEFAULT_REQUEST_ESTIMATE
         self._poll_started = 0.0
         self._poll_deadline: float | None = None
+        self._last_device_requests = 0
 
     def _warn(self, key: str, message: str, *args: Any) -> None:
         """Log a warning at most once per CLOUD_WARNING_INTERVAL for a given key."""
@@ -1133,10 +1134,29 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         )
 
     def _update_request_estimate(self, requests: int) -> None:
-        """Resize the running poll's budget once the request count is known."""
+        """Resize the running poll's budget as the request count becomes known.
+
+        The deadline only grows within a poll so requests counted in an
+        earlier phase never lose time already granted to them.
+        """
         self._request_estimate = max(1, requests)
         if self._poll_deadline is not None:
-            self._poll_deadline = self._poll_started + self._poll_budget(requests)
+            self._poll_deadline = max(
+                self._poll_deadline,
+                self._poll_started + self._poll_budget(requests),
+            )
+
+    def _inventory_request_count(self, installations: list[dict[str, Any]]) -> int:
+        pages = max(1, (len(installations) + 9) // 10)
+        return pages + len(installations)
+
+    @staticmethod
+    def _webserver_request_count(installations: list[dict[str, Any]]) -> int:
+        return sum(
+            len(item.get("ws_ids", []) or [])
+            for item in installations
+            if item.get("installation_id")
+        )
 
     def _stale_or_raise(self, err: UpdateFailed) -> dict[tuple[int, int], dict[str, Any]]:
         self._consecutive_failures += 1
@@ -1182,6 +1202,12 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
 
         try:
             installations = await self._get_installations()
+            # Size the budget before the sequential detail requests start.
+            self._update_request_estimate(
+                self._inventory_request_count(installations)
+                + self._webserver_request_count(installations)
+                + self._last_device_requests
+            )
         except (CloudApiError, aiohttp.ClientError, TimeoutError) as err:
             if cached is not None:
                 self._warn(
@@ -1305,9 +1331,12 @@ class AirzoneCloudCoordinator(AirzoneCoordinator):
         ):
             self._inventory_cache = None
             raise UpdateFailed("Some selected Cloud devices were not found")
-        # Worst case: inventory refresh (list + one detail per installation).
+        # Worst case: inventory refresh (list pages + one detail per installation).
+        self._last_device_requests = len(device_entries)
         self._update_request_estimate(
-            1 + len(installations) + len(ws_tasks) + len(device_entries)
+            self._inventory_request_count(installations)
+            + len(ws_tasks)
+            + len(device_entries)
         )
         device_status_results = await self._gather_limited(
             [
