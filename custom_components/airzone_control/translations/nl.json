@@ -363,6 +363,7 @@
           "cloud_include_categories": "Cloud categories to include",
           "cloud_include_device_ids": "Cloud devices to include",
           "cloud_include_bound_iaqs": "Include IAQ sensors linked to systems or zones",
+          "cloud_create_climates": "Create read-only Cloud thermostat (climate) entities",
           "cloud_exclude_iaq_names": "IAQ sensor names to exclude"
         },
         "description": "Maak tot 8 logische groepen aan met een naam en zone-selectie. Voor grote installaties gebruik je het geavanceerde JSON-veld (heeft voorrang op de UI-groepen)."

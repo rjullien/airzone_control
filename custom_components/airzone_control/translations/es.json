@@ -406,6 +406,7 @@
           "cloud_include_categories": "Categorías cloud a incluir",
           "cloud_include_device_ids": "Dispositivos cloud a incluir",
           "cloud_include_bound_iaqs": "Incluir sondas IAQ vinculadas a sistemas o zonas",
+          "cloud_create_climates": "Crear los termostatos (climate) Cloud de solo lectura",
           "cloud_exclude_iaq_names": "Nombres de sondas IAQ a excluir",
           "verify_ssl": "Verificar certificado TLS",
           "register_integration_driver": "Registrar Home Assistant como driver en Airzone"
